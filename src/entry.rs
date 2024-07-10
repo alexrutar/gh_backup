@@ -6,6 +6,8 @@ use serde::{
     Deserialize,
 };
 
+use crate::LastUpdated;
+
 /// A single repository entry returned by the GitHub API.
 #[derive(Debug, Deserialize)]
 pub struct Entry {
@@ -17,15 +19,18 @@ pub struct Entry {
 
 /// A deserializer for the list of repositories returned by the GitHub API.
 pub struct DeserializeUserRepos<'a> {
-    after: &'a DateTime<FixedOffset>,
+    last_updated: &'a LastUpdated,
     entries: &'a mut Vec<Entry>,
 }
 
 impl<'a> DeserializeUserRepos<'a> {
     /// Initialize the deserializer to deserialize all entries which are updated after a certain
     /// date, and append to `entries`.
-    pub fn new(after: &'a DateTime<FixedOffset>, entries: &'a mut Vec<Entry>) -> Self {
-        Self { after, entries }
+    pub fn new(last_updated: &'a LastUpdated, entries: &'a mut Vec<Entry>) -> Self {
+        Self {
+            last_updated,
+            entries,
+        }
     }
 }
 
@@ -41,7 +46,7 @@ impl<'a, 'de> Visitor<'de> for DeserializeUserRepos<'a> {
         A: SeqAccess<'de>,
     {
         while let Some(entry) = seq.next_element::<Entry>()? {
-            if &entry.last_updated >= &self.after {
+            if self.last_updated.is_outdated(&entry) {
                 self.entries.push(entry)
             }
         }

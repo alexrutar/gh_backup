@@ -1,3 +1,4 @@
+pub mod date;
 pub mod entry;
 
 use std::fs;
@@ -10,14 +11,19 @@ use serde::Deserializer;
 use tokio::process::Command;
 use tokio::task::JoinSet;
 
+use date::LastUpdated;
 use entry::DeserializeUserRepos;
 
 #[derive(Parser)]
 #[command(version, about, long_about = None)]
 struct Cli {
-    /// The maximum number of repositories to update in this run.
-    #[arg(short, long, value_name = "NUM", default_value_t = 100)]
-    limit: u64,
+    /// The maximum number of repositories per account to download.
+    #[arg(short, long, value_name = "NUM", default_value_t = 1000)]
+    max: usize,
+
+    /// The number of repositories to update this run.
+    #[arg(short, long, value_name = "NUM", default_value_t = 20)]
+    limit: usize,
 
     /// The users to back up.
     users: Vec<String>,
@@ -44,44 +50,44 @@ impl<'a> BackupFile<'a> {
     }
 }
 
-pub async fn git_update(repo: String) -> Result<ExitStatus, std::io::Error> {
+/// Update the repository, recording the update time and whether or not the update was successful.
+pub async fn git_update(
+    repo: String,
+) -> Result<(String, DateTime<FixedOffset>, ExitStatus), std::io::Error> {
+    let execute_time = Local::now().into();
+
     let status = Command::new("git")
         .args(["-C", "pull", &repo])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
         .await?;
-    println!("Pulling from repository '{}'", repo);
-    if !status.success() {
-        println!("Could not pull: cloning from repository '{}'", repo);
+
+    let status = if !status.success() {
         Command::new("gh")
             .args(["repo", "clone", &repo, &repo])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status()
-            .await
+            .await?
     } else {
-        Ok(status)
-    }
+        status
+    };
+
+    Ok((repo, execute_time, status))
 }
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     color_eyre::install()?;
 
-    let Cli { limit, users } = Cli::parse();
-    let limit_string = limit.to_string();
+    let Cli { limit, max, users } = Cli::parse();
+    let max_string = max.to_string();
 
     let backup_file = ".gh_last_backup";
 
     // read last updated
-    let last_updated = match fs::read(backup_file) {
-        Ok(bytes) => DateTime::<FixedOffset>::parse_from_rfc3339(std::str::from_utf8(&bytes)?)?,
-        Err(_) => DateTime::UNIX_EPOCH.into(),
-    };
-
-    // set the new update time before we begin requesting from the server
-    let script_start_time: DateTime<FixedOffset> = Local::now().into();
+    let mut last_updated = LastUpdated::read_from_file(backup_file)?;
 
     // initialize futures
     let mut entry_set = JoinSet::new();
@@ -92,7 +98,7 @@ async fn main() -> Result<()> {
                 "ls",
                 &user,
                 "--limit",
-                &limit_string,
+                &max_string,
                 "--json",
                 "nameWithOwner",
                 "--json",
@@ -112,6 +118,8 @@ async fn main() -> Result<()> {
         json_de.deserialize_seq(DeserializeUserRepos::new(&last_updated, &mut to_update))?;
     }
 
+    to_update.truncate(limit);
+
     // update the corresponding entries
     let mut update_set = JoinSet::new();
     for entry in to_update.drain(..) {
@@ -119,16 +127,15 @@ async fn main() -> Result<()> {
         update_set.spawn(cmd);
     }
 
-    let mut ok = true;
-    while let Some(status) = update_set.join_next().await {
-        ok = ok && status??.success();
+    // record the corresponding updates
+    while let Some(res) = update_set.join_next().await {
+        let (repo, execute_time, status) = res??;
+        if status.success() {
+            last_updated.update(repo, execute_time);
+        }
     }
 
-    // if everything succeeds, write the start time to the backup file
-    if ok {
-        println!("writing to backup");
-        fs::write(backup_file, script_start_time.to_rfc3339())?;
-    }
+    last_updated.write_to_file(backup_file)?;
 
     Ok(())
 }
