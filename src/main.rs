@@ -2,6 +2,7 @@ pub mod date;
 pub mod entry;
 
 use std::fs;
+use std::path::Path;
 use std::process::{ExitStatus, Stdio};
 
 use chrono::{DateTime, FixedOffset, Local};
@@ -25,7 +26,7 @@ struct Cli {
     #[arg(short, long, value_name = "NUM", default_value_t = 20)]
     limit: usize,
 
-    /// The users to back up.
+    /// The list of users to backup.
     users: Vec<String>,
 }
 
@@ -53,13 +54,15 @@ impl<'a> BackupFile<'a> {
 /// Update the repository, recording the update time and whether or not the update was successful.
 pub async fn git_update(
     repo: String,
+    backup_path: &'static Path,
 ) -> Result<(String, DateTime<FixedOffset>, ExitStatus), std::io::Error> {
     let execute_time = Local::now().into();
 
     let status = Command::new("git")
-        .args(["-C", "pull", &repo])
+        .args(["-C", &repo, "pull"])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
+        .current_dir(&backup_path)
         .status()
         .await?;
 
@@ -68,6 +71,7 @@ pub async fn git_update(
             .args(["repo", "clone", &repo, &repo])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
+            .current_dir(&backup_path)
             .status()
             .await?
     } else {
@@ -84,10 +88,12 @@ async fn main() -> Result<()> {
     let Cli { limit, max, users } = Cli::parse();
     let max_string = max.to_string();
 
-    let backup_file = ".gh_last_backup";
+    let xdg_dirs = xdg::BaseDirectories::with_prefix(env!("CARGO_PKG_NAME"))?;
+    let last_updated_path = xdg_dirs.place_data_file("last_updated.json")?;
+    let backup_path: &'static Path = Box::leak(Box::new(xdg_dirs.create_data_directory("backup")?));
 
     // read last updated
-    let mut last_updated = LastUpdated::read_from_file(backup_file)?;
+    let mut last_updated = LastUpdated::read_from_file(&last_updated_path)?;
 
     // initialize futures
     let mut entry_set = JoinSet::new();
@@ -104,6 +110,7 @@ async fn main() -> Result<()> {
                 "--json",
                 "updatedAt",
             ])
+            .current_dir(&backup_path)
             .output();
 
         entry_set.spawn(output);
@@ -123,7 +130,7 @@ async fn main() -> Result<()> {
     // update the corresponding entries
     let mut update_set = JoinSet::new();
     for entry in to_update.drain(..) {
-        let cmd = git_update(entry.repo);
+        let cmd = git_update(entry.repo, backup_path);
         update_set.spawn(cmd);
     }
 
@@ -135,7 +142,7 @@ async fn main() -> Result<()> {
         }
     }
 
-    last_updated.write_to_file(backup_file)?;
+    last_updated.write_to_file(last_updated_path)?;
 
     Ok(())
 }
